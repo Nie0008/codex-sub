@@ -1,0 +1,52 @@
+# Modified for Codex Sub; upstream provenance is recorded in NOTICE.
+name: codex-sub-checks
+
+# Validate every published change, including docs, images and ignore rules.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+          - windows-2022
+        python-version:
+          - "3.11"
+          - "3.13"
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests_python -p "test_*.py" -v
+
+      - name: Build and inspect source/runtime ZIP
+        run: python scripts/release_python.py --output-dir release-ci
+
+      - name: Verify ZIP output
+        run: >-
+          python -c "from pathlib import Path; import zipfile;
+          out=Path('release-ci');
+          version=Path('VERSION').read_text(encoding='utf-8').strip();
+          archives=list(out.glob(f'codex-sub-{version}-python.zip'));
+          assert len(archives)==1 and (out/'SHA256SUMS').is_file();
+          names=zipfile.ZipFile(archives[0]).namelist();
+          root=f'codex-sub-{version}-python/';
+          assert root+'codex-adaptive-agents.py' in names and root+'SHA256SUMS' in names;
+          assert all('__pycache__' not in n and not n.endswith('.pyc') for n in names)"

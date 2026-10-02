@@ -1,0 +1,19 @@
+Codex Adaptive Agents
+
+This distribution is provided under the Apache License, Version 2.0.
+See LICENSE for the complete license text.
+
+The installer, daily role selector, managed instructions, and verification
+runtime are implemented in this repository. No other agent-orchestration
+project is bundled or required for installation or execution.
+
+The Python runtime uses only the Python 3.11+ standard library and invokes
+the official Codex CLI for client capabilities and model execution.
+
+Codex Sub
+Maintained independently at https://github.com/Nie0008/codex-sub
+Derived from https://github.com/aweiht/codex-adaptive-agents, version 0.7.0,
+upstream commit e25998d49320234eb6f183d3bc18a6558397c907.
+Modified 2026-10-02: optional sub/think collaboration, execution records,
+skill installation, initialization, documentation and release hygiene.
+The original LICENSE and attribution notices are retained.

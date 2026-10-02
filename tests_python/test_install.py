@@ -1,0 +1,662 @@
+# Modified for Codex Sub; upstream origin and changes are recorded in NOTICE.
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import tomllib
+import unittest
+from unittest.mock import patch
+
+from codex_adaptive_agents import install as i
+from codex_adaptive_agents.platform import encode, read
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.home = self.base / 'home space 中文'
+        self.home.mkdir()
+        self.source = self.base / 'source'
+        for name in i.RUNTIME_FILES + i.SKILL_FILES:
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(read(i.ROOT / name) or b'# fixture\n')
+        self.mock = patch.object(i, 'ROOT', self.source)
+        self.mock.start()
+        self.addCleanup(self.mock.stop)
+        self.config = b'# keep\nmodel="gpt-5.6-sol" # chosen\nnotify=["a", "b"]\n[agents]\nargs=["x"]\n[agents.implementer]\nconfig_file="custom.toml"\n[mcp_servers.example]\ncommand="existing"\n'
+        (self.home / 'config.toml').write_bytes(self.config)
+        (self.home / 'AGENTS.md').write_bytes(b'User instructions\n')
+
+    def apply(self, uninstall=False):
+        _, _, plan = i.build(self.home, uninstall)
+        return i.apply(self.home, plan['plan_id'], uninstall)
+
+    def test_skill_lifecycle_preserves_override_and_defaults_and_rolls_back_failure(self):
+        override = b'Existing authoritative user rules\n'
+        (self.home / 'AGENTS.override.md').write_bytes(override)
+        originals = {name: (self.home / name).read_bytes()
+                     for name in ('config.toml', 'AGENTS.md', 'AGENTS.override.md')}
+        _, _, plan = i.build(self.home, skill=True)
+        self.assertEqual(plan['config_changes'], [])
+        self.assertEqual(plan['native_block'], '')
+        self.assertFalse(set(originals) & {row['path'] for row in plan['files']})
+        with self.assertRaisesRegex(RuntimeError, 'injected'):
+            i.apply(self.home, plan['plan_id'], skill=True, _fail_after=len(plan['files']) - 1)
+        self.assertIsNone(i.load(self.home))
+        self.assertFalse((self.home / i.SKILL).exists())
+        self.assertFalse((self.home / 'skills/think/SKILL.md').exists())
+        _, _, plan = i.build(self.home, skill=True)
+        result = i.apply(self.home, plan['plan_id'], skill=True)
+        self.assertEqual(result['status'], 'INSTALLED')
+        receipt = i.validate(self.home)
+        self.assertEqual(receipt['installation_mode'], 'skill')
+        self.assertEqual(set(receipt['owned_files']), i.owned_paths(True))
+        self.assertNotIn('{{COMMAND}}', (self.home / i.SKILL).read_text())
+        for name in i.THINK_FILES:
+            self.assertEqual((self.home / 'skills/think' / name).read_bytes(),
+                             (self.source / i.THINK_SOURCE / name).read_bytes())
+        _, _, plan = i.build(self.home, skill=True)
+        self.assertEqual(i.apply(self.home, plan['plan_id'], skill=True)['status'], 'IDEMPOTENT_PASS')
+        with self.assertRaisesRegex(ValueError, 'mode differs'):
+            i.build(self.home)
+        for name, before in originals.items():
+            self.assertEqual((self.home / name).read_bytes(), before)
+        self.apply(True)
+        for name, before in originals.items():
+            self.assertEqual((self.home / name).read_bytes(), before)
+        self.assertFalse((self.home / i.SKILL).exists())
+        self.assertFalse((self.home / 'skills/think/SKILL.md').exists())
+        self.assertFalse((self.home / i.ENTRY).exists())
+
+    def test_skill_rename_preserves_unowned_files_and_supports_failure_rollback(self):
+        template_path = self.source / i.SKILL_FILES[0]
+        current_template = template_path.read_bytes()
+        template_path.write_bytes(current_template.replace(b'name: sub', b'name: code-collaboration'))
+        with patch.object(i, 'SKILL', i.LEGACY_SKILL):
+            _, _, plan = i.build(self.home, skill=True)
+            i.apply(self.home, plan['plan_id'], skill=True)
+        template_path.write_bytes(current_template)
+        old_skill = self.home / i.LEGACY_SKILL
+        before = old_skill.read_bytes()
+        extra = old_skill.parent / 'user-notes.txt'
+        extra.write_bytes(b'keep user material\n')
+        original_config = (self.home / 'config.toml').read_bytes()
+        original_rules = (self.home / 'AGENTS.md').read_bytes()
+        new_skill = self.home / i.SKILL
+        new_skill.parent.mkdir()
+        new_skill.write_bytes(b'unmanaged skill\n')
+        with self.assertRaisesRegex(ValueError, 'unowned installation destination'):
+            i.build(self.home, skill=True)
+        self.assertEqual(old_skill.read_bytes(), before)
+        self.assertEqual(new_skill.read_bytes(), b'unmanaged skill\n')
+        new_skill.unlink()
+        _, _, plan = i.build(self.home, skill=True)
+        self.assertEqual(plan['files'][0]['path'], i.LEGACY_SKILL)
+        self.assertIsNone(plan['files'][0]['after_sha256'])
+        with self.assertRaisesRegex(RuntimeError, 'injected'):
+            i.apply(self.home, plan['plan_id'], skill=True, _fail_after=1)
+        self.assertEqual(old_skill.read_bytes(), before)
+        self.assertFalse(new_skill.exists())
+        self.assertIn(i.LEGACY_SKILL, i.validate(self.home)['owned_files'])
+        _, _, plan = i.build(self.home, skill=True)
+        result = i.apply(self.home, plan['plan_id'], skill=True)
+        self.assertFalse(old_skill.exists())
+        self.assertIn(b'name: sub', new_skill.read_bytes())
+        self.assertEqual(set(i.validate(self.home)['owned_files']), i.owned_paths(True))
+        self.assertEqual(extra.read_bytes(), b'keep user material\n')
+        i.recover(self.home, result['backup'])
+        self.assertEqual(old_skill.read_bytes(), before)
+        self.assertFalse(new_skill.exists())
+        self.assertIn(i.LEGACY_SKILL, i.validate(self.home)['owned_files'])
+        _, _, plan = i.build(self.home, skill=True)
+        i.apply(self.home, plan['plan_id'], skill=True)
+        self.apply(True)
+        self.assertFalse(new_skill.exists())
+        self.assertEqual(extra.read_bytes(), b'keep user material\n')
+        self.assertEqual((self.home / 'config.toml').read_bytes(), original_config)
+        self.assertEqual((self.home / 'AGENTS.md').read_bytes(), original_rules)
+
+    def test_legacy_skill_upgrade_adopts_only_identical_think_and_rolls_back(self):
+        _, _, plan = i.build(self.home, skill=True)
+        i.apply(self.home, plan['plan_id'], skill=True)
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        receipt = i.load(self.home)
+        receipt['version'] = '0.7.0'
+        for name in i.THINK_FILES:
+            receipt['owned_files'].pop('skills/think/' + name)
+            runtime = i.RESOURCE + '/runtime/' + i.THINK_SOURCE + name
+            receipt['owned_files'].pop(runtime)
+            (self.home / runtime).unlink()
+        manifest.write_bytes(encode(receipt))
+        before_receipt = manifest.read_bytes()
+        manual = self.home / 'skills/think/SKILL.md'
+        before_think = manual.read_bytes()
+        manual.write_bytes(before_think + b'local edit\n')
+        with self.assertRaisesRegex(ValueError, 'unowned installation destination'):
+            i.build(self.home, skill=True)
+        self.assertEqual(manifest.read_bytes(), before_receipt)
+        self.assertEqual(manual.read_bytes(), before_think + b'local edit\n')
+        manual.write_bytes(before_think)
+        _, _, plan = i.build(self.home, skill=True)
+        with self.assertRaisesRegex(RuntimeError, 'injected'):
+            i.apply(self.home, plan['plan_id'], skill=True, _fail_after=len(plan['files']) - 1)
+        self.assertEqual(manifest.read_bytes(), before_receipt)
+        self.assertEqual(manual.read_bytes(), before_think)
+        _, _, plan = i.build(self.home, skill=True)
+        result = i.apply(self.home, plan['plan_id'], skill=True)
+        self.assertEqual(set(i.validate(self.home)['owned_files']), i.owned_paths(True))
+        self.assertEqual(i.validate(self.home)['version'], i.__version__)
+        i.recover(self.home, result['backup'])
+        self.assertEqual(manifest.read_bytes(), before_receipt)
+        self.assertEqual(manual.read_bytes(), before_think)
+
+    def test_unmanaged_think_is_preserved_on_fresh_install(self):
+        path = self.home / 'skills/think/SKILL.md'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'personal skill\n')
+        with self.assertRaisesRegex(ValueError, 'unowned installation destination'):
+            i.build(self.home, skill=True)
+        self.assertEqual(path.read_bytes(), b'personal skill\n')
+        self.assertIsNone(i.load(self.home))
+
+    def test_install_reinstall_uninstall_preserves_later_unrelated_changes(self):
+        self.apply()
+        receipt = i.validate(self.home)
+        self.assertEqual(receipt['schema'], 4)
+        self.assertEqual(set(receipt['owned_files']), i.owned_paths())
+        self.assertNotIn('model', receipt['managed_keys'])
+        self.assertNotIn('model_reasoning_effort', receipt['managed_keys'])
+        self.assertEqual(i.build(self.home)[2]['config_changes'], [])
+        undo = i.build(self.home, True)[2]['config_changes']
+        self.assertNotIn('model', {row['key'] for row in undo})
+        self.assertEqual(self.apply()['status'], 'IDEMPOTENT_PASS')
+        with (self.home / 'config.toml').open('ab') as stream:
+            stream.write(b'\n[projects.example]\ntrust_level="trusted"\n')
+        with (self.home / 'AGENTS.md').open('ab') as stream:
+            stream.write(b'Later instructions\n')
+        self.apply(True)
+        result = tomllib.loads((self.home / 'config.toml').read_text())
+        self.assertEqual(result['model'], 'gpt-5.6-sol')
+        self.assertEqual(result['notify'], ['a', 'b'])
+        self.assertEqual(result['mcp_servers']['example']['command'], 'existing')
+        self.assertIn('example', result['projects'])
+        self.assertEqual((self.home / 'AGENTS.md').read_bytes(), b'User instructions\nLater instructions\n')
+        self.assertFalse((self.home / i.ENTRY).exists())
+
+    def test_stale_plan_and_managed_conflict(self):
+        _, _, plan = i.build(self.home)
+        with (self.home / 'AGENTS.md').open('ab') as stream:
+            stream.write(b'concurrent\n')
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            i.apply(self.home, plan['plan_id'])
+        self.apply()
+        path = self.home / 'config.toml'
+        path.write_text(path.read_text().replace('gpt-6-luna', 'gpt-5.6-sol'))
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            i.build(self.home, True)
+
+    def test_current_to_future_upgrade_accepts_unchanged_defaults(self):
+        home = self.base / 'upgrade-future-home'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(
+            b'model = "gpt-6-astra"\n[agents]\n'
+            b'default_subagent_model = "gpt-5.6-luna"\nmax_threads = 5\n')
+        (home / 'AGENTS.md').write_bytes(b'old instructions\n')
+        with patch.object(i, '__version__', '0.6.0'):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        old_receipt = json.loads((home / i.RESOURCE / 'install-manifest.json').read_bytes())
+        self.assertEqual(old_receipt['version'], '0.6.0')
+        self.assertNotIn('model', {row['key'] for row in old_receipt['config_changes']})
+
+        future = dict(i.VERSION_PROFILES['0.6.0'])
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}), \
+                patch.object(i, '__version__', '0.7.0'):
+            _, _, upgrade = i.build(home)
+            self.assertEqual(upgrade['config_changes'], [])
+            self.assertEqual(i.apply(home, upgrade['plan_id'])['status'], 'INSTALLED')
+            receipt = i.validate(home)
+        self.assertEqual(receipt['version'], '0.7.0')
+        self.assertNotIn('model', {row['key'] for row in receipt['config_changes']})
+
+    def test_v06_upgrade_preserves_root_preferences_and_uninstall(self):
+        home = self.base / 'upgrade-root-preferences-home'
+        home.mkdir()
+        original = (
+            b'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\nnotify = ["keep"]\n'
+            b'[agents]\ndefault_subagent_model = "gpt-5.6-luna"\n'
+            b'default_subagent_reasoning_effort = "max"\nmax_threads = 5\n'
+            b'max_concurrent_threads_per_session = 5\n[mcp_servers.custom]\ncommand = "keep"\n'
+        )
+        (home / 'config.toml').write_bytes(original)
+        (home / 'AGENTS.md').write_bytes(b'user instructions\n')
+        current_role = i.role
+        legacy_role = lambda effort: current_role(effort).replace(b'gpt-6-luna', b'gpt-5.6-luna')
+        with patch.object(i, '__version__', '0.6.0'), patch.object(i, 'role', side_effect=legacy_role):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+            old_role = tomllib.loads((home / 'agents' / 'adaptive_luna_xhigh.toml').read_text())
+            self.assertEqual(old_role['model'], 'gpt-5.6-luna')
+
+        config_path = home / 'config.toml'
+        config = config_path.read_bytes()
+        config = config.replace(b'model_reasoning_effort = "max"',
+                                b'model_reasoning_effort = "xhigh"')
+        config = config.replace(b'notify = ["keep"]', b'notify = ["keep", "user-added"]')
+        config_path.write_bytes(config)
+        old_receipt = i.load(home)
+        self.assertIn('model_reasoning_effort', old_receipt['managed_keys'])
+        with self.assertRaisesRegex(ValueError, 'managed configuration changed'):
+            i.validate(home)
+
+        _, _, upgrade = i.build(home)
+        self.assertNotIn('model', {row['key'] for row in upgrade['config_changes']})
+        self.assertNotIn('model_reasoning_effort', {row['key'] for row in upgrade['config_changes']})
+        self.assertEqual(i.apply(home, upgrade['plan_id'])['status'], 'INSTALLED')
+        upgraded = i.validate(home)
+        self.assertEqual(upgraded['version'], i.__version__)
+        self.assertNotIn('model', upgraded['managed_keys'])
+        self.assertNotIn('model_reasoning_effort', upgraded['managed_keys'])
+        self.assertNotIn('model', {row['key'] for row in upgraded['config_changes']})
+        self.assertNotIn('model_reasoning_effort', {row['key'] for row in upgraded['config_changes']})
+        current = tomllib.loads(config_path.read_text())
+        self.assertEqual(current['model'], 'gpt-6-astra')
+        self.assertEqual(current['model_reasoning_effort'], 'xhigh')
+        self.assertEqual(current['notify'], ['keep', 'user-added'])
+        self.assertEqual(current['mcp_servers']['custom']['command'], 'keep')
+
+        config_path.write_bytes(config_path.read_bytes().replace(b'gpt-6-luna', b'gpt-5.6-luna'))
+        with self.assertRaisesRegex(ValueError, 'managed configuration changed'):
+            i.validate(home)
+        config_path.write_bytes(config_path.read_bytes().replace(b'gpt-5.6-luna', b'gpt-6-luna'))
+        role_path = home / 'agents' / 'adaptive_luna_xhigh.toml'
+        role_path.write_bytes(role_path.read_bytes() + b'# user edit\n')
+        with self.assertRaisesRegex(ValueError, 'managed file changed'):
+            i.validate(home)
+        role_path.write_bytes(i.role('xhigh'))
+
+        _, _, uninstall = i.build(home, uninstall=True)
+        self.assertNotIn('model', {row['key'] for row in uninstall['config_changes']})
+        self.assertNotIn('model_reasoning_effort', {row['key'] for row in uninstall['config_changes']})
+        self.assertEqual(i.apply(home, uninstall['plan_id'], uninstall=True)['status'], 'UNINSTALLED')
+        final = tomllib.loads(config_path.read_text())
+        self.assertEqual(final['model'], 'gpt-6-astra')
+        self.assertEqual(final['model_reasoning_effort'], 'xhigh')
+        self.assertEqual(final['notify'], ['keep', 'user-added'])
+        self.assertEqual(final['mcp_servers']['custom']['command'], 'keep')
+
+    def test_new_install_preserves_existing_root_preferences(self):
+        config = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n[agents.implementer]\nmodel = "custom-role"\n'
+        (self.home / 'config.toml').write_bytes(config)
+        _, _, plan = i.build(self.home)
+        self.assertNotIn('model', {row['key'] for row in plan['config_changes']})
+        self.assertNotIn('model_reasoning_effort', {row['key'] for row in plan['config_changes']})
+        i.apply(self.home, plan['plan_id'])
+        result = tomllib.loads((self.home / 'config.toml').read_text())
+        self.assertEqual(result['model'], 'gpt-6-astra')
+        self.assertEqual(result['model_reasoning_effort'], 'xhigh')
+        self.assertEqual(result['agents']['implementer']['model'], 'custom-role')
+        role = tomllib.loads((self.home / 'agents' / 'adaptive_luna_xhigh.toml').read_text())
+        self.assertEqual(role['model'], 'gpt-6-luna')
+        self.assertEqual(role['model_reasoning_effort'], 'xhigh')
+
+    def test_unknown_illegal_version_and_downgrade_refuse(self):
+        with patch.object(i, '__version__', '0.6.0'):
+            self.apply()
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        original = json.loads(manifest.read_bytes())
+        for version in ('0.9.0', '0.5.0', 'not-a-version'):
+            with self.subTest(version=version):
+                mutated = dict(original, version=version)
+                manifest.write_bytes(encode(mutated))
+                with self.assertRaisesRegex(ValueError, 'unsupported installation version'):
+                    i.load(self.home)
+        for schema in (1, 2, 3):
+            with self.subTest(schema=schema):
+                manifest.write_bytes(encode(dict(original, schema=schema)))
+                with self.assertRaisesRegex(ValueError, 'invalid installation receipt'):
+                    i.load(self.home)
+        manifest.write_bytes(encode(original))
+        future = dict(i.VERSION_PROFILES['0.6.0'])
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}):
+            with patch.object(i, '__version__', '0.7.0'):
+                _, _, upgrade = i.build(self.home)
+                i.apply(self.home, upgrade['plan_id'])
+            with patch.object(i, '__version__', '0.6.0'):
+                with self.assertRaisesRegex(ValueError, 'downgrade'):
+                    i.build(self.home)
+
+    def test_incomplete_managed_keys_reject_before_upgrade_writes(self):
+        self.apply()
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        receipt = json.loads(manifest.read_bytes())
+        receipt['managed_keys'].remove('agents.default_subagent_model')
+        manifest.write_bytes(encode(receipt))
+        config = self.home / 'config.toml'
+        before = config.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'invalid managed configuration receipt'):
+            i.build(self.home)
+        self.assertEqual(config.read_bytes(), before)
+
+    def test_approved_future_profile_composes_original_values(self):
+        home = self.base / 'future-profile-home'
+        home.mkdir()
+        original = (b'model = "gpt-6-astra"\n[agents]\n'
+                    b'default_subagent_model = "gpt-5.6-sol"\nmax_threads = 5\n')
+        (home / 'config.toml').write_bytes(original)
+        (home / 'AGENTS.md').write_bytes(b'old instructions\n')
+        current_role = i.role
+        legacy_role = lambda effort: current_role(effort).replace(b'gpt-6-luna', b'gpt-5.6-luna')
+        with patch.object(i, '__version__', '0.6.0'), patch.object(i, 'role', side_effect=legacy_role):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+            old_role = tomllib.loads((home / 'agents' / 'adaptive_luna_xhigh.toml').read_text())
+            self.assertEqual(old_role['model'], 'gpt-5.6-luna')
+        future = dict(i.VERSION_PROFILES['0.6.0'])
+        future['model'] = '"synthetic-future-root"'
+        future['agents.default_subagent_model'] = '"synthetic-future-leaf"'
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}), \
+                patch.object(i, '__version__', '0.7.0'):
+            _, _, upgrade = i.build(home)
+            delta = {row['key']: row for row in upgrade['config_changes']}
+            self.assertEqual(delta['model']['before'], '"gpt-6-astra"')
+            self.assertEqual(delta['model']['after'], '"synthetic-future-root"')
+            self.assertEqual(delta['agents.default_subagent_model']['before'],
+                             '"gpt-5.6-luna"')
+            self.assertEqual(i.apply(home, upgrade['plan_id'])['status'], 'INSTALLED')
+            receipt = i.validate(home)
+            rows = {row['key']: row for row in receipt['config_changes']}
+            self.assertEqual(rows['model']['before'], '"gpt-6-astra"')
+            self.assertEqual(rows['agents.default_subagent_model']['before'],
+                             '"gpt-5.6-sol"')
+            self.assertEqual(i.build(home)[2]['files'], [])
+            _, _, uninstall = i.build(home, uninstall=True)
+            self.assertEqual(i.apply(home, uninstall['plan_id'], uninstall=True)['status'],
+                             'UNINSTALLED')
+        self.assertEqual((home / 'config.toml').read_bytes(), original)
+
+    def test_managed_conflict_does_not_write_during_upgrade(self):
+        self.apply()
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        before_manifest = manifest.read_bytes()
+        config = self.home / 'config.toml'
+        config.write_bytes(config.read_bytes().replace(b'gpt-6-luna', b'user-model'))
+        before_config = config.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            i.build(self.home)
+        self.assertEqual(config.read_bytes(), before_config)
+        self.assertEqual(manifest.read_bytes(), before_manifest)
+
+    def test_upgrade_rollback_restores_immediate_previous_receipt_and_repeats(self):
+        home = self.base / 'rollback-upgrade-home'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model = "gpt-6-astra"\n')
+        (home / 'AGENTS.md').write_bytes(b'old instructions\n')
+        with patch.object(i, '__version__', '0.6.0'):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        future = dict(i.VERSION_PROFILES['0.6.0'])
+        future['model'] = '"synthetic-rollback-root"'
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}), \
+                patch.object(i, '__version__', '0.7.0'):
+            _, _, upgrade = i.build(home)
+            result = i.apply(home, upgrade['plan_id'])
+            self.assertEqual(i.build(home)[2]['files'], [])
+            self.assertEqual(i.apply(home, i.build(home)[2]['plan_id'])['status'],
+                             'IDEMPOTENT_PASS')
+            self.assertEqual(i.recover(home, result['backup'])['status'], 'ROLLBACK_EXACT_PASS')
+            self.assertEqual(i.validate(home)['version'], '0.6.0')
+            _, _, repeat = i.build(home)
+            self.assertEqual(repeat['config_changes'][0]['after'], '"synthetic-rollback-root"')
+            self.assertEqual(i.apply(home, repeat['plan_id'])['status'], 'INSTALLED')
+            self.assertEqual(i.validate(home)['version'], '0.7.0')
+
+    def test_future_upgrade_preserves_ownership_metadata(self):
+        home = self.base / 'future-metadata-upgrade-home'
+        home.mkdir()
+        original = b'model = "gpt-6-astra"\n'
+        (home / 'config.toml').write_bytes(original)
+        (home / 'AGENTS.md').write_bytes(b'old instructions\n')
+        with patch.object(i, '__version__', '0.6.0'):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        manifest = home / i.RESOURCE / 'install-manifest.json'
+        before = json.loads(manifest.read_bytes())
+        future = dict(i.VERSION_PROFILES['0.6.0'])
+        future['model'] = '"synthetic-metadata-root"'
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}), \
+                patch.object(i, '__version__', '0.7.0'):
+            _, _, upgrade = i.build(home)
+            self.assertEqual(i.apply(home, upgrade['plan_id'])['status'], 'INSTALLED')
+            receipt = i.validate(home)
+        for key in i.RECEIPT_METADATA:
+            self.assertIn(key, receipt)
+        for key in ('config_existed', 'agents_existed', 'created_config_tables'):
+            self.assertEqual(receipt[key], before[key])
+        with patch.dict(i.VERSION_PROFILES, {'0.7.0': future}), \
+                patch.object(i, '__version__', '0.7.0'):
+            _, _, uninstall = i.build(home, uninstall=True)
+            i.apply(home, uninstall['plan_id'], uninstall=True)
+        self.assertEqual((home / 'config.toml').read_bytes(), original)
+
+    def test_uninstall_preserves_later_provider_edit(self):
+        home = self.base / 'provider-edit-home'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model = "gpt-5.6-sol"\n')
+        (home / 'AGENTS.md').write_bytes(b'old instructions\n')
+        with patch.object(i, '__version__', '0.6.0'):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        config = home / 'config.toml'
+        config.write_bytes(b'model_provider = "custom"\n' + config.read_bytes())
+        with patch.object(i, '__version__', '0.6.0'):
+            _, _, uninstall = i.build(home, uninstall=True)
+            self.assertEqual(i.apply(home, uninstall['plan_id'], uninstall=True)['status'],
+                             'UNINSTALLED')
+        self.assertIn(b'model_provider = "custom"\n', config.read_bytes())
+
+    def test_failure_rolls_back_and_recovery_rejects_later_edit(self):
+        _, _, plan = i.build(self.home)
+        with self.assertRaisesRegex(RuntimeError, 'injected'):
+            i.apply(self.home, plan['plan_id'], _fail_after=4)
+        self.assertEqual((self.home / 'config.toml').read_bytes(), self.config)
+        self.assertEqual((self.home / 'AGENTS.md').read_bytes(), b'User instructions\n')
+        result = self.apply()
+        with (self.home / 'config.toml').open('ab') as stream:
+            stream.write(b'# changed later\n')
+        with self.assertRaisesRegex(ValueError, 'preserved'):
+            i.recover(self.home, result['backup'])
+
+    def test_case_variant_alias_supports_validation_upgrade_uninstall_and_recovery(self):
+        home = self.base / 'CaseHome'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model="old"\n')
+        (home / 'AGENTS.md').write_bytes(b'user instructions\n')
+        alias = self.base / 'casehome'
+        with patch.object(i, 'ROOT', self.source):
+            _, _, plan = i.build(home)
+            installed = i.apply(home, plan['plan_id'])
+            if not alias.exists() or not os.path.samefile(home, alias):
+                self.skipTest('case-sensitive filesystem; no case alias exists')
+            self.assertEqual(i.validate(alias)['codex_home'], str(home))
+            self.assertEqual(i.build(alias)[2]['files'], [])
+            rollback = i.recover(alias, installed['backup'])
+            self.assertEqual(rollback['status'], 'ROLLBACK_EXACT_PASS')
+            _, _, reinstall = i.build(alias)
+            i.apply(alias, reinstall['plan_id'])
+            _, _, uninstall = i.build(alias, uninstall=True)
+            result = i.apply(alias, uninstall['plan_id'], uninstall=True)
+        self.assertEqual(result['status'], 'UNINSTALLED')
+        self.assertEqual(tomllib.loads((home / 'config.toml').read_text())['model'], 'old')
+
+    def test_receipt_rejects_credentials_copied_to_different_home(self):
+        home = self.base / 'OriginalHome'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model="old"\n')
+        (home / 'AGENTS.md').write_bytes(b'user instructions\n')
+        with patch.object(i, 'ROOT', self.source):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        copied = self.base / 'CopiedHome'
+        shutil.copytree(home, copied)
+        with self.assertRaisesRegex(ValueError, 'invalid installation receipt'):
+            i.load(copied)
+
+    def test_receipt_rejects_symbolic_link_home_alias(self):
+        home = self.base / 'RealHome'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model="old"\n')
+        (home / 'AGENTS.md').write_bytes(b'user instructions\n')
+        with patch.object(i, 'ROOT', self.source):
+            _, _, plan = i.build(home)
+            i.apply(home, plan['plan_id'])
+        alias = self.base / 'LinkHome'
+        try:
+            alias.symlink_to(home, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symbolic links unavailable on this runner')
+        with self.assertRaisesRegex(ValueError, 'symlink or reparse point rejected'):
+            i.load(alias)
+
+    def test_override_and_unowned_files_and_provider_fail_closed(self):
+        override = self.home / 'AGENTS.override.md'
+        override.write_bytes(b'')
+        with self.assertRaisesRegex(ValueError, 'override'):
+            i.build(self.home)
+        override.unlink()
+        (self.home / 'config.toml').write_text('model_provider="custom"\n')
+        with self.assertRaisesRegex(ValueError, 'provider'):
+            i.build(self.home)
+
+    def test_inline_table_and_comments_survive(self):
+        raw = b'# header\nagents={enabled=false, args=["x"], max_threads=2}\n'
+        merged, changes = i.transform(raw, 'merge', desired=i.desired(raw))
+        restored, _ = i.transform(merged, 'revert', changes=changes)
+        obj = tomllib.loads(restored.decode())
+        self.assertEqual(obj['agents'], dict(enabled=False, args=['x'], max_threads=2))
+        self.assertTrue(restored.startswith(b'# header'))
+
+    def test_recovery_exact(self):
+        result = self.apply()
+        self.assertEqual(i.recover(self.home, result['backup'])['status'], 'ROLLBACK_EXACT_PASS')
+        self.assertEqual((self.home / 'config.toml').read_bytes(), self.config)
+        self.assertEqual((self.home / 'AGENTS.md').read_bytes(), b'User instructions\n')
+
+    def test_implicit_tables_and_wrong_types(self):
+        for raw in (b'agents.enabled=false\nagents.args=["x"]\n',
+                    b'[agents.implementer]\nconfig_file="custom.toml"\n'):
+            changed, changes = i.transform(raw, 'merge', desired=i.desired(raw))
+            restored, _ = i.transform(changed, 'revert', changes=changes)
+            self.assertEqual(tomllib.loads(raw.decode()), tomllib.loads(restored.decode()))
+        with self.assertRaises(ValueError):
+            raw=b'agents.enabled=1\n'
+            i.transform(raw, 'merge', desired=i.desired(raw))
+
+    def test_fresh_uninstall_removes_only_empty_installer_structures(self):
+        home = self.base / 'fresh-home'
+        home.mkdir()
+        _, _, plan = i.build(home)
+        self.assertEqual(i.apply(home, plan['plan_id'])['status'], 'INSTALLED')
+        receipt = i.validate(home)
+        self.assertFalse(receipt['config_existed'])
+        self.assertFalse(receipt['agents_existed'])
+        self.assertEqual(receipt['created_config_tables'], [{'name': 'agents', 'separator': 1}])
+
+        _, _, uninstall = i.build(home, uninstall=True)
+        self.assertEqual(i.apply(home, uninstall['plan_id'], uninstall=True)['status'], 'UNINSTALLED')
+        self.assertFalse((home / 'config.toml').exists())
+        self.assertFalse((home / 'AGENTS.md').exists())
+
+    def test_uninstall_preserves_user_content_in_created_table_and_agents_file(self):
+        home = self.base / 'preserve-home'
+        home.mkdir()
+        (home / 'config.toml').write_bytes(b'model = "old"\n')
+        _, _, plan = i.build(home)
+        i.apply(home, plan['plan_id'])
+        with (home / 'config.toml').open('ab') as stream:
+            stream.write(b'# user note\ncustom = true\n')
+        with (home / 'AGENTS.md').open('ab') as stream:
+            stream.write(b'User addition\n')
+
+        _, _, uninstall = i.build(home, uninstall=True)
+        i.apply(home, uninstall['plan_id'], uninstall=True)
+        config = (home / 'config.toml').read_bytes()
+        self.assertIn(b'model = "old"\n', config)
+        self.assertIn(b'[agents]\n', config)
+        self.assertIn(b'# user note\ncustom = true\n', config)
+        self.assertEqual((home / 'AGENTS.md').read_bytes(), b'User addition\n')
+
+    def test_receipt_requires_current_managed_and_ownership_metadata(self):
+        self.apply()
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        original = json.loads(manifest.read_bytes())
+        for key in ('managed_keys', 'created_config_tables'):
+            with self.subTest(key=key):
+                mutated = dict(original)
+                mutated.pop(key)
+                manifest.write_bytes(encode(mutated))
+                with self.assertRaisesRegex(ValueError, 'invalid'):
+                    i.load(self.home)
+                manifest.write_bytes(encode(original))
+
+    def test_committed_recover_without_backup_is_read_only_but_explicit_rollback_works(self):
+        result = self.apply()
+        transaction = self.home / i.RESOURCE / 'transaction.json'
+        before_transaction = transaction.read_bytes()
+        before_config = (self.home / 'config.toml').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'explicit backup'):
+            i.recover(self.home, '')
+        self.assertEqual(transaction.read_bytes(), before_transaction)
+        self.assertEqual((self.home / 'config.toml').read_bytes(), before_config)
+        with self.assertRaisesRegex(ValueError, 'committed'):
+            i.recover(self.home)
+        self.assertEqual(transaction.read_bytes(), before_transaction)
+        self.assertEqual((self.home / 'config.toml').read_bytes(), before_config)
+        self.assertEqual(i.recover(self.home, result['backup'])['status'], 'ROLLBACK_EXACT_PASS')
+        self.assertEqual((self.home / 'config.toml').read_bytes(), self.config)
+
+    def test_backup_symlink_is_rejected_before_outside_creation(self):
+        resource = self.home / i.RESOURCE
+        resource.mkdir()
+        outside = self.base / 'outside-backups'
+        outside.mkdir()
+        link = resource / 'backups'
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symbolic links unavailable on this runner')
+        _, _, plan = i.build(self.home)
+        with self.assertRaisesRegex(ValueError, 'symlink or reparse point rejected'):
+            i.apply(self.home, plan['plan_id'])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_malformed_receipt_shapes_are_stable_value_errors(self):
+        self.apply()
+        manifest = self.home / i.RESOURCE / 'install-manifest.json'
+        original = json.loads(manifest.read_bytes())
+        cases = [
+            ('config_changes', {'config_changes': {'key': 'model'}}),
+            ('config_change_row', {'config_changes': ['model']}),
+            ('block', {'block': []}),
+            ('metadata_name', {'created_config_tables': [{'name': [], 'separator': 1}]}),
+            ('managed_keys', {'managed_keys': []}),
+        ]
+        for label, replacement in cases:
+            with self.subTest(label=label):
+                mutated = dict(original)
+                mutated.update(replacement)
+                manifest.write_bytes(encode(mutated))
+                with self.assertRaisesRegex(ValueError, 'invalid'):
+                    i.load(self.home)
+                manifest.write_bytes(encode(original))
+        manifest.write_bytes(encode([]))
+        with self.assertRaisesRegex(ValueError, 'invalid installation receipt'):
+            i.load(self.home)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,319 @@
+# Modified for Codex Sub; upstream origin and changes are recorded in NOTICE.
+"""Real isolated Python entry lifecycle with fake public CLI/source data."""
+from datetime import datetime, timezone
+from contextlib import ExitStack, redirect_stdout
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from codex_adaptive_agents import cli, code_shadow, install, policy, process_registry, verify
+from codex_adaptive_agents.platform import clean_env, run
+
+
+class CLITests(unittest.TestCase):
+    def test_initializer_installs_both_skills_and_checks_doctor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            home = base / 'codex home 中文'
+            home.mkdir()
+            originals = {'config.toml': b'model="user-choice"\n',
+                         'AGENTS.override.md': b'User authority\n', 'auth.json': b'{}\n'}
+            for name, data in originals.items():
+                (home / name).write_bytes(data)
+            launcher = base / ('codex.cmd' if os.name == 'nt' else 'codex')
+            if os.name == 'nt':
+                launcher.write_text('@echo off\r\necho codex-cli 0.147.0\r\n')
+            else:
+                launcher.write_text('#!/bin/sh\n[ "$1" = "--version" ] || exit 2\necho codex-cli 0.147.0\n')
+                launcher.chmod(0o755)
+            script = install.ROOT / 'scripts/init.py'
+            command = [sys.executable, '-B', str(script), '--codex-home', str(home),
+                       '--codex', str(launcher)]
+            preview = run([*command, '--dry-run'], timeout=30)
+            self.assertEqual(preview.returncode, 0, preview.stderr.decode())
+            plan = json.loads(preview.stdout)
+            self.assertEqual(plan['config_changes'], [])
+            self.assertFalse((home / install.SKILL).exists())
+            decoder = json.JSONDecoder()
+            for expected in ('INSTALLED', 'IDEMPOTENT_PASS'):
+                result = run([*command, '--yes'], timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+                installed, offset = decoder.raw_decode(result.stdout.decode())
+                ready = json.loads(result.stdout.decode()[offset:])
+                self.assertEqual(installed['status'], expected)
+                self.assertEqual(ready['status'], 'READY')
+                self.assertEqual((home / 'skills/think/SKILL.md').read_bytes(),
+                                 (install.ROOT / install.THINK_SOURCE / 'SKILL.md').read_bytes())
+            for name, data in originals.items():
+                self.assertEqual((home / name).read_bytes(), data)
+
+    def test_invalid_safety_flags_reject_before_side_effects(self):
+        cases = [
+            (['verify', '--live', '--dry-run'], '--dry-run'),
+            (['refresh', '--dry-run'], '--dry-run'),
+            (['select', '--dry-run'], '--dry-run'),
+            (['doctor', '--dry-run'], '--dry-run'),
+            (['recover', '--yes', '--dry-run'], '--dry-run'),
+            (['rollback', '--backup', 'recorded', '--yes', '--dry-run'], '--dry-run'),
+            (['process-init', '--project', '.', '--dry-run'], '--dry-run'),
+            (['process-init', '--project', '.', '--summary'], '--summary'),
+            (['process-check', '--project', '.', '--run-id', 'a' * 32, '--summary'], '--summary'),
+            (['doctor', '--summary'], 'process options'),
+            (['internal-smoke-check', '--project', '.', '--dry-run'], '--dry-run'),
+            (['recover', '--backup', 'recorded', '--yes'], '--backup'),
+            (['install', '--backup', 'recorded', '--yes'], '--backup'),
+            (['rollback', '--yes'], '--backup'),
+            (['rollback', '--backup', '', '--yes'], '--backup'),
+            (['code-shadow', '--project', '.', '--input', 'tasks.jsonl', '--purpose', 'verification', '--dry-run'], '--dry-run'),
+            (['code-shadow', '--project', '.', '--input', 'tasks.jsonl', '--purpose', 'verification', '--live'], '--live'),
+            (['code-shadow', '--project', '.', '--input', 'tasks.jsonl', '--purpose', 'verification', '--yes'], 'unsupported'),
+            (['install', '--input', 'tasks.jsonl'], '--input'),
+            (['doctor', '--skill'], '--skill'),
+            (['code-record', '--project', '.', '--input', 'tasks.jsonl', '--purpose', 'verification', '--dry-run'], '--dry-run'),
+            (['code-record', '--project', '.', '--input', 'tasks.jsonl', '--purpose', 'verification', '--yes'], 'unsupported'),
+        ]
+        boundaries = [(install, 'validate'), (install, 'build'), (install, 'apply'),
+                      (install, 'recover'), (cli, 'resolve_codex'), (cli, 'doctor'),
+                      (policy, 'select'), (policy, 'refresh_capabilities'),
+                      (verify, 'run'), (verify, 'check'),
+                      (process_registry, 'init_run'), (process_registry, 'check_run'),
+                      (process_registry, 'cleanup_run'), (tempfile, 'mkdtemp'), (code_shadow, 'observe'),
+                      (code_shadow, 'record')]
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'must not be created'
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments), ExitStack() as stack:
+                    mocks = [stack.enter_context(patch.object(module, name))
+                             for module, name in boundaries]
+                    output = stack.enter_context(redirect_stdout(StringIO()))
+                    rc = cli.main(['--codex-home', str(home), *arguments])
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(result['status'], 'ERROR')
+                    self.assertIn(expected, result['error'])
+                    for mocked in mocks:
+                        mocked.assert_not_called()
+                    self.assertFalse(home.exists())
+
+    def test_recovery_and_explicit_rollback_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / 'home'
+            for command, backup in [('recover', None), ('rollback', 'recorded-backup')]:
+                with self.subTest(command=command), \
+                        patch.object(install, 'recover', return_value={'status': 'ROLLBACK_EXACT_PASS'}) as recover, \
+                        redirect_stdout(StringIO()) as output:
+                    arguments = ['--codex-home', str(home), command, '--yes']
+                    if backup:
+                        arguments += ['--backup', backup]
+                    self.assertEqual(cli.main(arguments), 0)
+                    self.assertEqual(json.loads(output.getvalue())['status'], 'ROLLBACK_EXACT_PASS')
+                    recover.assert_called_once_with(home, backup)
+
+    def test_portable_moved_download_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            source = base / 'download space 中文'
+            for name in install.RUNTIME_FILES:
+                dest = source / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(install.ROOT / name, dest)
+            home = base / 'codex home 中文'
+            home.mkdir()
+            (home / 'config.toml').write_text('# keep\nnotify=["x"]\n', encoding='utf-8')
+            fakepy = base / 'fake_codex.py'
+            fakepy.write_text('''import json, sys
+args=sys.argv[1:]
+if args == ['--version']: print('codex-cli 0.147.0')
+elif args == ['debug','models']:
+ print(json.dumps({'models': [
+  {'slug':'gpt-6-astra','supported_reasoning_levels':[{'effort':'max'}]},
+  {'slug':'gpt-6-luna','supported_reasoning_levels':[{'effort':e} for e in ('low','medium','high','xhigh','max')]}
+ ]}))
+else: sys.exit(2)
+''', encoding='utf-8')
+            launcher = base / ('codex.cmd' if os.name == 'nt' else 'codex')
+            if os.name == 'nt':
+                launcher.write_text('@echo off\r\n"' + sys.executable + '" "' + str(fakepy) + '" %*\r\n', encoding='utf-8')
+            else:
+                launcher.write_text('#!' + sys.executable + '\n' + fakepy.read_text(encoding='utf-8'), encoding='utf-8')
+                launcher.chmod(0o755)
+            # Only external data is mocked. Execute the actual entry file and
+            # moved installed module tree in separate Python processes.
+            runner = base / 'offline_runner.py'
+            runner.write_text('''import runpy, sys
+from pathlib import Path
+entry=sys.argv.pop(1)
+sys.path.insert(0,str(Path(entry).parent))
+from codex_adaptive_agents import policy
+policy.fetch_sources=lambda *a,**k: []
+policy.FetchSources=policy.fetch_sources
+sys.argv[0]=entry
+runpy.run_path(entry,run_name='__main__')
+''', encoding='utf-8')
+            env = clean_env()
+            # No Go in PATH. Python and the fake Codex are resolved absolutely.
+            env['PATH'] = os.environ.get('SystemRoot', 'C:\\Windows') + '\\System32' if os.name == 'nt' else '/usr/bin:/bin'
+            probe = run([str(launcher), '--version'], env=env, timeout=10)
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode('utf-8', errors='replace'))
+            self.assertEqual(probe.stdout.strip(), b'codex-cli 0.147.0')
+            def invoke(entry, *args, expect=0):
+                result = run([sys.executable, '-B', str(runner), str(entry), '--codex-home', str(home),
+                              '--codex', str(launcher), *args], env=env, timeout=30)
+                self.assertEqual(result.returncode, expect, result.stdout.decode('utf-8') + result.stderr.decode('utf-8'))
+                return json.loads(result.stdout)
+            entry = source / 'codex-adaptive-agents.py'
+            initial = invoke(entry, 'doctor', expect=1)
+            self.assertEqual(initial['status'], 'NOT_READY')
+            plan = invoke(entry, 'install', '--dry-run')
+            self.assertTrue(plan['plan_id'])
+            self.assertFalse((home / install.ENTRY).exists())
+            installed = invoke(entry, 'install', '--yes')
+            self.assertEqual(installed['status'], 'INSTALLED')
+            source.rename(base / 'download moved')
+            entry = home / install.ENTRY
+            ready = invoke(entry, 'doctor')
+            self.assertEqual(ready['status'], 'READY_FALLBACK')
+            project = base / 'project space'
+            project.mkdir()
+            # The installed entry retains process handoff after the download
+            # moves; worker argv after -- is never parsed as installer flags.
+            handoff = invoke(entry, 'process-init', '--project', str(project))
+            run_id = handoff['run_id']
+            command = invoke(entry, 'process-run', '--project', str(project),
+                             '--run-id', run_id, '--owner', 'cli-test',
+                             '--purpose', 'installed handoff verification', '--',
+                             sys.executable, '-c',
+                             'import sys; assert sys.argv[1:] == ["--yes", "--yes"]; print("handoff-ok")',
+                             '--yes', '--yes')
+            self.assertEqual(command['status'], 'SUCCESS')
+            summary_command = invoke(entry, 'process-run', '--project', str(project),
+                                    '--run-id', run_id, '--owner', 'cli-summary-test',
+                                    '--purpose', 'installed compact output', '--summary', '--',
+                                    sys.executable, '-c',
+                                    'import sys; sys.stdout.write("verbose-" * 4000)')
+            self.assertEqual(summary_command['status'], 'SUCCESS')
+            self.assertNotIn('stdout', summary_command)
+            self.assertNotIn('stderr', summary_command)
+            self.assertLess(len(json.dumps(summary_command).encode('utf-8')), 4096)
+            self.assertTrue(summary_command['output_complete'])
+            self.assertEqual(summary_command['captured_bytes']['stdout'], len('verbose-') * 4000)
+            self.assertEqual(Path(summary_command['logs']['stdout']).read_text(), 'verbose-' * 4000)
+            checked = invoke(entry, 'process-check', '--project', str(project), '--run-id', run_id)
+            self.assertEqual(checked['status'], 'CLEAN')
+            self.assertEqual(invoke(entry, 'process-cleanup', '--project', str(project),
+                                    '--run-id', run_id)['status'], 'CLEAN')
+            rejected = invoke(entry, 'process-run', '--project', str(project), '--run-id', run_id,
+                              '--owner', 'late', '--purpose', 'must reject a closed run', '--',
+                              sys.executable, '-c', 'raise RuntimeError("must not execute")', expect=1)
+            self.assertEqual(rejected['status'], 'ERROR')
+            selected = invoke(entry, 'select', '--project', str(project), '--explain')
+            self.assertEqual(selected['role'], 'adaptive_luna_xhigh')
+            self.assertFalse(invoke(entry, 'select', '--project', str(project), '--explain')['refreshed'])
+            self.assertEqual(invoke(entry, 'refresh')['role'], 'adaptive_luna_xhigh')
+            self.assertEqual(invoke(entry, 'install', '--yes')['status'], 'IDEMPOTENT_PASS')
+            self.assertEqual(invoke(entry, 'uninstall', '--yes')['status'], 'UNINSTALLED')
+            self.assertFalse(entry.exists())
+            self.assertIn('# keep', (home / 'config.toml').read_text(encoding='utf-8'))
+
+    def test_project_refresh_recovers_same_day_failure_without_touching_other_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            home = base / 'codex home'
+            project = base / 'project'
+            other_project = base / 'other project'
+            home.mkdir()
+            project.mkdir()
+            other_project.mkdir()
+            now = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+            fake_codex = base / 'codex'
+            fake_codex.write_text('', encoding='utf-8')
+            fake_codex.chmod(0o755)
+
+            with patch.dict(os.environ, {'TZ': 'UTC'}, clear=False), \
+                    patch.object(policy, 'FetchSources', return_value=[]), \
+                    patch.object(policy, 'DirectSupportedEfforts',
+                                 side_effect=policy.PolicyError('catalog unavailable')):
+                first = policy.select(home, project, now=now)
+            self.assertEqual(first['status'], 'blocked')
+
+            with patch.dict(os.environ, {'TZ': 'UTC'}, clear=False), \
+                    patch.object(policy, 'FetchSources', return_value=[]), \
+                    patch.object(policy, 'DirectSupportedEfforts', return_value=list(policy.EFFORTS)):
+                other = policy.select(home, other_project, now=now)
+            self.assertEqual(other['role'], 'adaptive_luna_xhigh')
+            other_cache = other_project / '.codex-adaptive-agents/state/policy-cache.json'
+            other_before = other_cache.read_bytes()
+
+            snapshot = {
+                'schema': 1,
+                'checked_at': policy._stamp(now),
+                'supported_efforts': list(policy.EFFORTS),
+                'root_model': 'gpt-6-astra',
+                'child_model': 'gpt-6-luna',
+                'codex': str(fake_codex),
+                'cli_version': 'codex-cli 0.147.0',
+                'evidence': 'public_client_catalogue',
+            }
+
+            def fake_refresh(selected_home, _codex, *, now=None):
+                resource = Path(selected_home) / policy.RESOURCE
+                resource.mkdir(parents=True, exist_ok=True)
+                policy._atomic(policy._snapshot_path(Path(selected_home)),
+                               policy._encode(snapshot))
+                return snapshot
+
+            calls = []
+            original_select = policy.select
+            fixed_now = now
+
+            def fixed_clock_select(selected_home, selected_project=None, *, force=False, now=None):
+                calls.append({
+                    'home': str(selected_home),
+                    'project': None if selected_project is None else str(selected_project),
+                    'force': force,
+                })
+                return original_select(selected_home, selected_project, force=force,
+                                       now=now if now is not None else fixed_now)
+
+            output = StringIO()
+            with patch.dict(os.environ, {'TZ': 'UTC'}, clear=False), \
+                    patch.object(install, 'validate', return_value={'schema': 4}), \
+                    patch.object(cli, 'resolve_codex', return_value=str(fake_codex)), \
+                    patch.object(policy, 'refresh_capabilities', side_effect=fake_refresh), \
+                    patch.object(policy, 'DirectSupportedEfforts', return_value=list(policy.EFFORTS)), \
+                    patch.object(policy, 'FetchSources', return_value=[]), \
+                    patch.object(policy, 'select', side_effect=fixed_clock_select), \
+                    redirect_stdout(output):
+                refresh_rc = cli.main([
+                    '--codex-home', str(home),
+                    'refresh',
+                    '--project', str(project),
+                ])
+
+            self.assertEqual(refresh_rc, 0)
+            self.assertEqual(json.loads(output.getvalue())['role'], 'adaptive_luna_xhigh')
+            self.assertEqual(calls, [{
+                'home': str(home),
+                'project': str(project),
+                'force': True,
+            }])
+            self.assertFalse((home / policy.RESOURCE / 'state/policy-cache.json').exists())
+            self.assertEqual(other_cache.read_bytes(), other_before)
+
+            with patch.dict(os.environ, {'TZ': 'UTC'}, clear=False), \
+                    patch.object(policy, 'FetchSources', return_value=[]), \
+                    patch.object(policy, 'DirectSupportedEfforts',
+                                 side_effect=AssertionError('same-day select must use project cache')):
+                recovered = original_select(home, project, now=now)
+            self.assertEqual(recovered['role'], 'adaptive_luna_xhigh')
+            self.assertFalse(recovered['refreshed'])
+
+
+if __name__ == '__main__':
+    unittest.main()
