@@ -42,6 +42,14 @@ Workbench 和 Laya 是可选的已有能力，需另行配置。本项目不携�
 - [验证范围](docs/VALIDATION.md)
 - [开发与打包检查](CONTRIBUTING.md)
 
+## 搭配 Agent Workbench
+
+[Agent Workbench](https://github.com/Nie0008/agent-workbench-open) 是本地多 Agent 桌面工作台，支持通过桌面界面、命令或 MCP 派发 Claude Code、Grok、DSH 和 ZCode 任务，集中管理项目背景、任务授权、执行进度与结果。
+
+搭配使用时，Sub 帮助 Codex 安排分工与核验，Workbench 承接外部 Agent 的执行和任务管理。需要不同执行器或模型、续办已有任务，或统一查看任务状态时，可以组合使用。Workbench 需单独安装并配置执行器和模型；Sub 也可以只使用 Codex 的原生子代理。
+
+[了解 Agent Workbench 与接入方式](https://github.com/Nie0008/agent-workbench-open#安装与初始化)。
+
 ## 来源与发布范围
 
 沿用 [Apache-2.0](LICENSE)，保留上游 [NOTICE](NOTICE)。公开源码按 [release-manifest.json](release-manifest.json) 的文件清单生成；本机文档、绝对路径、认证、配置、会话、账号数据和运行记录不进入公开版本。打包时检查所有文件中的机器路径与常见凭据特征，安全问题报告见 [SECURITY](SECURITY.md)。

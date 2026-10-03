@@ -42,6 +42,14 @@ Existing Workbench and Laya are optional integrations, configured separately. Th
 - [Verification scope](docs/VALIDATION.md)
 - [Contribution and package checks](CONTRIBUTING.md)
 
+## Pair with Agent Workbench
+
+[Agent Workbench](https://github.com/Nie0008/agent-workbench-open) is a local desktop workbench for multiple Agents. Use its desktop interface, CLI or MCP tools to dispatch Claude Code, Grok, DSH and ZCode tasks, and manage project context, permissions, progress and results in one place.
+
+Used together, Sub helps Codex organize assignments and verification, while Workbench runs external Agents and manages their tasks. Pair them when you need different executors or models, want to resume an existing task, or want to view task status in one place. Install Workbench and configure its executors and models separately; Sub can also work with Codex's native subagents alone.
+
+[Explore Agent Workbench and its setup guide](https://github.com/Nie0008/agent-workbench-open#安装与初始化).
+
 ## License and privacy
 
 [Apache-2.0](LICENSE), with the upstream [NOTICE](NOTICE) retained. Published sources are selected by [release-manifest.json](release-manifest.json); local configuration, authentication, account data, transcripts and execution records are excluded. The release builder also rejects machine paths and common credential signatures. See [security guidance](SECURITY.md).
